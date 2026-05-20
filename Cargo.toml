@@ -4,3 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.102"
+dotenv = "0.15.0"
+futures = "0.3.32"
+solana-client = "3.1.14"
+spl-token-2022-interface = "3.0.0"
+spl-token-interface = "2.0.0"
+sqlx = { version = "0.8.6", features = ["postgres"] }
+tokio = { version = "1.52.3", features = ["full"] }
