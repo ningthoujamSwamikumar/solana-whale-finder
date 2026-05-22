@@ -1551,8 +1551,11 @@ name = "indexer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bs58",
  "dotenv",
  "futures",
+ "serde",
+ "serde_json",
  "solana-client",
  "spl-token-2022-interface 3.0.0",
  "spl-token-interface",
@@ -4781,6 +4784,8 @@ dependencies = [
  "sha2",
  "smallvec",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
  "tracing",
  "url",
 ]
@@ -4819,6 +4824,7 @@ dependencies = [
  "sqlx-postgres",
  "sqlx-sqlite",
  "syn 2.0.117",
+ "tokio",
  "url",
 ]
 

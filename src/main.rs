@@ -1,17 +1,20 @@
-use std::str::FromStr;
+use std::{str::FromStr, sync::{Arc, Mutex}};
 
 use anyhow::{Ok, Result};
 use futures::StreamExt;
 use solana_client::{
     nonblocking::{
-        pubsub_client::{PubsubClient, PubsubClientResult},
+        pubsub_client::PubsubClient,
         rpc_client::RpcClient,
-    },
-    rpc_config::{CommitmentConfig, RpcTransactionConfig, RpcTransactionLogsConfig},
-    rpc_response::transaction::{Signature, VersionedMessage},
+    }, rpc_config::{RpcTransactionConfig, RpcTransactionLogsConfig}, rpc_request::Address, rpc_response::{
+        OptionSerializer,
+        transaction::{Signature, VersionedMessage},
+    }
 };
-use spl_token_interface::instruction::TokenInstruction;
-use sqlx::{PgPool, Pool, Postgres};
+use spl_token_interface::{instruction::TokenInstruction, state::GenericTokenAccount};
+use sqlx::{PgPool, Postgres};
+
+pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -27,14 +30,17 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let pg_result = sqlx::query(
+    // lets use only the token accounts for now, we can add the owners later if necessary
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS whale_txns (
-            signature TEXT PRIMARY_KEY, 
-            slot BIGINT NOT NULL, 
-            source_owner TEXT NOT NULL, 
-            destination_owner TEXT NOT NULL, 
+            id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            signature TEXT, 
+            slot BIGINT NOT NULL,
+            source_token_acc TEXT NOT NULL,
+            dest_token_acc TEXT NOT NULL,
             amount BIGINT NOT NULL, 
-            mint TEXT NOT NULL
+            mint TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );",
     )
     .execute(&pg_pool)
@@ -42,17 +48,16 @@ async fn main() -> Result<()> {
 
     // create rpc client
     let rpc_url = std::env::var("RPC_URL").expect("Required Rpc endpoint Url!");
-    let rpc_client = RpcClient::new(rpc_url);
+    let arc_rpc_client = Arc::new(RpcClient::new(rpc_url));
+
+    let usdc_mint = USDC_MINT.to_string();
 
     //create websocket connection
     let ws_rpc_url = std::env::var("WEBSOCKET_RPC_URL").expect("Required 'WEBSOCKET_RPC_URL'!");
     let ws_client = PubsubClient::new(ws_rpc_url).await?;
     let (mut log_stream, _log_unsubscribe) = ws_client
         .logs_subscribe(
-            solana_client::rpc_config::RpcTransactionLogsFilter::Mentions(vec![
-                //spl_token_interface::ID.to_string(),
-                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(), // usdc mint
-            ]),
+            solana_client::rpc_config::RpcTransactionLogsFilter::Mentions(vec![usdc_mint.clone()]),
             RpcTransactionLogsConfig { commitment: None },
         )
         .await?;
@@ -82,40 +87,304 @@ async fn main() -> Result<()> {
 
         // fetch transaction from rpc node
         let txn_signature = Signature::from_str(log_response.value.signature.as_str())?;
-        let encoded_txn = rpc_client
+        let rpc_client = arc_rpc_client.clone();
+        let encoded_confirmed_txn = rpc_client
             .get_transaction_with_config(
                 &txn_signature,
                 RpcTransactionConfig {
                     encoding: Some(solana_client::rpc_config::UiTransactionEncoding::Base58),
+                    max_supported_transaction_version: Some(0),
                     ..Default::default()
                 },
             )
             .await?;
+
         // decode and process each transaction
-        if let Some(txn) = encoded_txn.transaction.transaction.decode() {
+        if let Some(txn) = encoded_confirmed_txn.transaction.transaction.decode() {
             let (account_keys, insns) = match txn.message {
                 VersionedMessage::Legacy(msg) => (msg.account_keys, msg.instructions),
-                VersionedMessage::V0(msg) => (msg.account_keys, msg.instructions),
+                VersionedMessage::V0(msg) => {
+                    let mut account_keys = msg.account_keys;
+                    if let Some(txn_meta) = &encoded_confirmed_txn.transaction.meta {
+                        if let OptionSerializer::Some(loaded_addresses) = &txn_meta.loaded_addresses {
+                            account_keys.extend(loaded_addresses.writable.iter().map(|s| Address::from_str(s.as_str()).unwrap()));
+                            account_keys.extend(loaded_addresses.readonly.iter().map(|s| Address::from_str(s.as_str()).unwrap()));
+                        }
+                    }
+                    (account_keys, msg.instructions)
+                },
             };
-            insns
+
+            // build query to do batch insertion
+            let mut qb: sqlx::QueryBuilder<Postgres> = sqlx::QueryBuilder::new(
+                "INSERT INTO whale_txns
+                ( signature, slot, source_token_acc, dest_token_acc, amount, mint ) ",
+            );
+
+            let signature = log_response.value.signature;
+            let slot = encoded_confirmed_txn.slot as i64;
+
+            let insert_tuples = Arc::new(Mutex::new(vec![]));
+            // process outer instructions
+            let insn_futures = insns
                 .iter()
                 .filter(|insn| {
                     account_keys[insn.program_id_index as usize] == spl_token_interface::ID
                 })
-                .for_each(|insn| {
-                    let token_insn = TokenInstruction::unpack(&insn.data).unwrap();
-                    let source_acc = account_keys[insn.accounts[0] as usize];
-                    let dest_acc = account_keys[insn.accounts[1] as usize];
-                    let signer_acc = account_keys[insn.accounts[2] as usize];
-                    match token_insn {
-                        TokenInstruction::Transfer { amount } => {
-                            //sqlx::query("INSERT") 
-                            todo!()
-                        },
-                        TokenInstruction::TransferChecked { amount, decimals } => todo!(),
-                        _ => todo!(),
-                    };
+                .map( |insn| {
+                    let account_keys = account_keys.clone();
+                    let usdc_mint = usdc_mint.clone();
+                    let txn_meta = encoded_confirmed_txn.transaction.meta.clone();
+                    let insert_tuples = insert_tuples.clone();
+                    let signature = signature.clone();
+                    let rpc_client = arc_rpc_client.clone();
+
+                    async move {
+                        let token_insn = TokenInstruction::unpack(&insn.data).unwrap();
+                        match token_insn {
+                            TokenInstruction::Transfer { amount } => {
+                                // whale amount validation
+                                if amount < 10_000_000_000 {
+                                    return ();
+                                } 
+                                // the transfer now consists of whale amount
+                                let source_acc = account_keys[insn.accounts[0] as usize];
+                                let dest_acc = account_keys[insn.accounts[1] as usize];
+                                if let Some(meta) = txn_meta.as_ref() {
+                                    if let OptionSerializer::Some(pre_token_balances) =
+                                        meta.pre_token_balances.as_ref()
+                                    {
+                                        if let Some(source_pre_token_bal) =
+                                            pre_token_balances.iter().find(|token_acc| {
+                                                token_acc.account_index == insn.accounts[0]
+                                            })
+                                        {
+                                            if source_pre_token_bal.mint == usdc_mint {
+                                                // verified that the transfer is usdc transfer
+                                                let mut tuples = insert_tuples.lock().unwrap();
+                                                tuples.push((
+                                                    signature.clone(),
+                                                    slot,
+                                                    source_acc.to_string(),
+                                                    dest_acc.to_string(),
+                                                    amount as i64,
+                                                    usdc_mint.clone(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    if let Some(source_token_acc_data) =
+                                        rpc_client.get_account_data(&source_acc).await.ok()
+                                    {
+                                        if let Some(source_token_acc_mint) =
+                                            spl_token_interface::state::Account::unpack_account_mint(
+                                                &source_token_acc_data.as_slice(),
+                                            )
+                                        {
+                                            if source_token_acc_mint.to_string() == usdc_mint {
+                                                let mut tuples = insert_tuples.lock().unwrap();
+                                                tuples.push((
+                                                    signature.clone(),
+                                                    slot,
+                                                    source_acc.to_string(),
+                                                    dest_acc.to_string(),
+                                                    amount as i64,
+                                                    usdc_mint.clone(),
+                                                ));
+                                            };
+                                        };
+                                    } else {
+                                        println!("Failed to fetch source token account data! Assuming {} as usdc token account", source_acc.to_string());
+                                        // mint is not validated
+                                        let mut tuples = insert_tuples.lock().unwrap();
+                                                tuples.push((
+                                            signature.clone(),
+                                            slot,
+                                            source_acc.to_string(),
+                                            dest_acc.to_string(),
+                                            amount as i64,
+                                            usdc_mint.clone(),
+                                        ));
+                                    }
+                                };
+                            }
+                            TokenInstruction::TransferChecked { amount, decimals: _ } => {
+                                // whale amount validation
+                                if amount < 10_000_000_000 {
+                                    return ();
+                                } 
+                                // the transfer now consists of whale amount
+                                let source_acc = account_keys[insn.accounts[0] as usize];
+                                let mint = account_keys[insn.accounts[1] as usize];
+                                let dest_acc = account_keys[insn.accounts[2] as usize];
+                                // check if the mint is usdc
+                                if mint.to_string() == usdc_mint {
+                                    let mut tuples = insert_tuples.lock().unwrap();
+                                    tuples.push((
+                                        signature.clone(),
+                                        slot,
+                                        source_acc.to_string(),
+                                        dest_acc.to_string(),
+                                        amount as i64,
+                                        usdc_mint.clone(),
+                                    ));
+                                };
+                            },
+                            _ => {println!("Not a transfer instruction!");},
+                        }
+                    }
                 });
+                    
+            futures::future::join_all(insn_futures).await;
+            
+            // check and process inner instructions as well
+            if let Some(meta) = encoded_confirmed_txn.transaction.meta {
+                if let OptionSerializer::Some(inner_insns) = meta.inner_instructions {
+                    for inna_insns in inner_insns {
+                        for inna_insn in inna_insns.instructions {
+                            match inna_insn {
+                                solana_client::rpc_response::UiInstruction::Compiled(ui_compiled_instruction) => {
+                                    // check if the program is spl token program
+                                    if account_keys[ui_compiled_instruction.program_id_index as usize] == spl_token_interface::ID {
+                                        //decode the instruction data
+                                        let raw_data = bs58::decode(ui_compiled_instruction.data).into_vec()?;
+                                        let token_insn = TokenInstruction::unpack(&raw_data)?;
+                                        match token_insn {
+                                            TokenInstruction::Transfer { amount }=>{
+                                                if amount < 10_000_000_000 {
+                                                    continue;
+                                                }
+                                                // the transfer now consist of whale amount
+                                                let source_acc = account_keys[ui_compiled_instruction.accounts[0] as usize];
+                                                let dest_acc = account_keys[ui_compiled_instruction.accounts[1] as usize];
+                                                let source_acc_data = rpc_client.get_account_data(&source_acc).await?;
+                                                if let Some(mint) = spl_token_interface::state::Account::unpack_account_mint(&source_acc_data) {
+                                                    if mint.to_string() == usdc_mint {
+                                                        let mut tuples = insert_tuples.lock().unwrap();
+                                                        tuples.push((
+                                                            signature.clone(),
+                                                            slot,
+                                                            source_acc.to_string(),
+                                                            dest_acc.to_string(),
+                                                            amount as i64,
+                                                            usdc_mint.clone(),
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            TokenInstruction::TransferChecked { amount, decimals: _ }=>{
+                                                // whale amount validation
+                                                if amount < 10_000_000_000 {
+                                                    continue;
+                                                } 
+                                                // the transfer now consists of whale amount
+                                                let source_acc = account_keys[ui_compiled_instruction.accounts[0] as usize];
+                                                let mint = account_keys[ui_compiled_instruction.accounts[1] as usize];
+                                                let dest_acc = account_keys[ui_compiled_instruction.accounts[2] as usize];
+                                                // check if the mint is usdc
+                                                if mint.to_string() == usdc_mint {
+                                                    let mut tuples = insert_tuples.lock().unwrap();
+                                                    tuples.push((
+                                                        signature.clone(),
+                                                        slot,
+                                                        source_acc.to_string(),
+                                                        dest_acc.to_string(),
+                                                        amount as i64,
+                                                        usdc_mint.clone(),
+                                                    ));
+                                                };
+                                            },
+                                            _=>{
+                                                println!("Not a transfer instruction!");
+                                            }
+                                        }
+                                    }
+                                },
+                                solana_client::rpc_response::UiInstruction::Parsed(ui_parsed_instruction) => {
+                                    match ui_parsed_instruction {
+                                        solana_client::rpc_response::UiParsedInstruction::Parsed(parsed_instruction) => {
+                                            if parsed_instruction.program_id == spl_token_interface::ID.to_string() {
+                                                if let (Some(instruction_type), Some(info)) = (parsed_instruction.parsed.get("type").and_then(|t|t.as_str()), parsed_instruction.parsed.get("info")){
+                                                    match instruction_type {
+                                                        "transfer" => {
+                                                            // Standard transfer instruction
+                                                            let source_acc = info.get("source").and_then(|s| s.as_str()).unwrap_or("");
+                                                            let dest_acc = info.get("destination").and_then(|d|d.as_str()).unwrap_or("");
+                                                            let amount = info.get("amount").and_then(|a|a.as_str()).unwrap_or("");
+                                                            let amount_i64 = i64::from_str(amount).unwrap_or(0);
+
+                                                            // validate the mint of source account if non empty, and check if its a whale transfer
+                                                            if !source_acc.is_empty() && amount_i64 > 10_000_000_000 {
+                                                                let source_acc_data = rpc_client.get_account_data(&Address::from_str(source_acc)?).await?;
+                                                                if let Some(source_acc_mint) = spl_token_interface::state::Account::unpack_account_mint(source_acc_data.as_slice()) {
+                                                                    if source_acc_mint.to_string() == usdc_mint {
+                                                                        let mut tuples = insert_tuples.lock().unwrap();
+                                                                        tuples.push((
+                                                                            signature.clone(),
+                                                                            slot,
+                                                                            source_acc.to_string(),
+                                                                            dest_acc.to_string(),
+                                                                            amount_i64,
+                                                                            usdc_mint.clone(),
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        "TransferChecked" => {
+                                                            let source_acc = info.get("source").and_then(|s| s.as_str()).unwrap_or("");
+                                                            let dest_acc = info.get("destination").and_then(|d|d.as_str()).unwrap_or("");
+                                                            let amount = info.get("amount").and_then(|a|a.as_str()).unwrap_or("");
+                                                            let mint = info.get("mint").and_then(|m| m.as_str()).unwrap_or("");
+                                                            let amount_i64 = i64::from_str(amount).unwrap_or(0);
+
+                                                            // validate the mint of source account if non empty, and check if its a whale
+                                                            if !mint.is_empty() && amount_i64 > 10_000_000_000 && mint.to_string() == usdc_mint {
+                                                                let mut tuples = insert_tuples.lock().unwrap();
+                                                                tuples.push((
+                                                                    signature.clone(),
+                                                                    slot,
+                                                                    source_acc.to_string(),
+                                                                    dest_acc.to_string(),
+                                                                    amount_i64,
+                                                                    usdc_mint.clone(),
+                                                                ));
+                                                            }
+                                                        }
+                                                        _ => {
+                                                            println!("Not a transfer instruction!");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        solana_client::rpc_response::UiParsedInstruction::PartiallyDecoded(ui_partially_decoded_instruction) => {
+                                            if ui_partially_decoded_instruction.program_id == spl_token_interface::ID.to_string() {
+                                                println!("Unexpected Instruction format found!");
+                                            }
+                                        },
+                                    }
+                                },
+                            }
+                        }
+                    }
+                }
+            };
+
+            // we will do this after inner instructions are handled
+            let tuples =  insert_tuples.lock().unwrap();
+            if tuples.len() > 0 {
+                qb.push_values(tuples.iter(), |mut b, (sig, slot, source, dest, amnt, mint) | {
+                    b.push_bind(sig).push_bind(slot).push_bind(source).push_bind(dest).push_bind(amnt).push_bind(mint);
+                });
+
+                let pg_result = qb.build().execute(&pg_pool).await?;
+                println!("inserted {} rows", pg_result.rows_affected());
+            } else {
+                println!("There are no tuples found to insert into db!");
+            }
+
         };
     }
 
