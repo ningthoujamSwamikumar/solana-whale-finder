@@ -11,7 +11,7 @@ use solana_client::{
         transaction::{Signature, VersionedMessage},
     }
 };
-use spl_token_interface::{instruction::TokenInstruction, state::GenericTokenAccount};
+use spl_token_interface::{instruction::TokenInstruction};
 use sqlx::{PgPool, Postgres};
 
 pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -146,7 +146,6 @@ async fn main() -> Result<()> {
                     let txn_meta = encoded_confirmed_txn.transaction.meta.clone();
                     let insert_tuples = insert_tuples.clone();
                     let signature = signature.clone();
-                    let rpc_client = arc_rpc_client.clone();
 
                     println!("Debug log - Passed the program id filter, and checking futher...");
 
@@ -189,34 +188,11 @@ async fn main() -> Result<()> {
                                                 ));
                                             }
                                         }
+                                    }else {
+                                        println!("Debug log - No pre token balance found!");
                                     }
                                 } else {
-                                    println!("Debug log - Validating mint by fetching account data from rpc");
-                                    if let Some(source_token_acc_data) =
-                                        rpc_client.get_account_data(&source_acc).await.ok()
-                                    {
-                                        if let Some(source_token_acc_mint) =
-                                            spl_token_interface::state::Account::unpack_account_mint(
-                                                &source_token_acc_data.as_slice(),
-                                            )
-                                        {
-                                            if source_token_acc_mint.to_string() == usdc_mint {
-                                                println!("Debug log - Waiting for insert_tuples lock");
-                                                let mut tuples = insert_tuples.lock().unwrap();
-                                                println!("Debug log - *************** Adding a new tuple into insert_tuples *******************");
-                                                tuples.push((
-                                                    signature.clone(),
-                                                    slot,
-                                                    source_acc.to_string(),
-                                                    dest_acc.to_string(),
-                                                    amount as i64,
-                                                    usdc_mint.clone(),
-                                                ));
-                                            };
-                                        };
-                                    } else {
-                                        println!("Failed to fetch source token account data! Assuming {} as usdc token account. So ignoring the transfer!", source_acc.to_string());
-                                    }
+                                    println!("Debug log - No transaction meta found");
                                 };
                             }
                             TokenInstruction::TransferChecked { amount, decimals: _ } => {
@@ -255,19 +231,18 @@ async fn main() -> Result<()> {
             
             // check and process inner instructions as well
             println!("Debug log - Processing inner instruction if present any transaction meta...");
-            if let Some(meta) = encoded_confirmed_txn.transaction.meta {
-                if let OptionSerializer::Some(inner_insns) = meta.inner_instructions {
+            if let Some(meta) = &encoded_confirmed_txn.transaction.meta {
+                if let OptionSerializer::Some(inner_insns) = &meta.inner_instructions {
                     println!("Debug log - Processing inner instructions...");
                     for inna_insns in inner_insns {
-                        for inna_insn in inna_insns.instructions {
+                        for inna_insn in &inna_insns.instructions {
                             match inna_insn {
                                 solana_client::rpc_response::UiInstruction::Compiled(ui_compiled_instruction) => {
                                     // check if the program is spl token program
                                     if account_keys[ui_compiled_instruction.program_id_index as usize] == spl_token_interface::ID {
                                         println!("Debug log - Found token program in inner instruction");
                                         //decode the instruction data
-                                        let raw_data = bs58::decode(ui_compiled_instruction.data).into_vec()?;
-                                        println!("raw_data length: {}", raw_data.len());
+                                        let raw_data = bs58::decode(&ui_compiled_instruction.data).into_vec()?;
                                         let sanitized_raw_data = sanitize_token_data(&raw_data.as_slice());
                                         match TokenInstruction::unpack(&sanitized_raw_data) {
                                             std::result::Result::Ok(token_insn) => {
@@ -282,22 +257,27 @@ async fn main() -> Result<()> {
                                                         // the transfer now consist of whale amount
                                                         let source_acc = account_keys[ui_compiled_instruction.accounts[0] as usize];
                                                         let dest_acc = account_keys[ui_compiled_instruction.accounts[1] as usize];
-                                                        let source_acc_data = rpc_client.get_account_data(&source_acc).await?;
-                                                        println!("Debug log - Unpacking account mint to validate the mint");
-                                                        if let Some(mint) = spl_token_interface::state::Account::unpack_account_mint(&source_acc_data) {
-                                                            if mint.to_string() == usdc_mint {
-                                                                println!("Debug log - ************* Adding a whale record ************ ");
-                                                                let mut tuples = insert_tuples.lock().unwrap();
-                                                                tuples.push((
-                                                                    signature.clone(),
-                                                                    slot,
-                                                                    source_acc.to_string(),
-                                                                    dest_acc.to_string(),
-                                                                    amount as i64,
-                                                                    usdc_mint.clone(),
-                                                                ));
+                                                        if let OptionSerializer::Some(pre_token_balances) = &meta.pre_token_balances {
+                                                            if let Some(source_pre_token_bal) = pre_token_balances.iter().find(|p|p.account_index == ui_compiled_instruction.accounts[0]) {
+                                                                if source_pre_token_bal.mint != usdc_mint {
+                                                                    println!("Debug log - Source acc doesn't have usdc mint");
+                                                                    continue;
+                                                                }
+                                                            }else{
+                                                                println!("Debug log - Failed to find the source account in pre token balances");
                                                             }
-                                                        }
+                                                        };
+                                                        // usdc mint transfer
+                                                        println!("Debug log - ************* Adding a whale record ************ ");
+                                                        let mut tuples = insert_tuples.lock().unwrap();
+                                                        tuples.push((
+                                                            signature.clone(),
+                                                            slot,
+                                                            source_acc.to_string(),
+                                                            dest_acc.to_string(),
+                                                            amount as i64,
+                                                            usdc_mint.clone(),
+                                                        ));
                                                     }
                                                     TokenInstruction::TransferChecked { amount, decimals: _ }=>{
                                                         println!("Debug log - Found TransferChecked as inner instruction");
@@ -354,22 +334,29 @@ async fn main() -> Result<()> {
 
                                                             // validate the mint of source account if non empty, and check if its a whale transfer
                                                             if !source_acc.is_empty() && amount_i64 > 10_000_000_000 {
-                                                                let source_acc_data = rpc_client.get_account_data(&Address::from_str(source_acc)?).await?;
                                                                 println!("Debug log - Validating mint");
-                                                                if let Some(source_acc_mint) = spl_token_interface::state::Account::unpack_account_mint(source_acc_data.as_slice()) {
-                                                                    if source_acc_mint.to_string() == usdc_mint {
-                                                                        println!("Debug log - **************** Adding a whale record ************************");
-                                                                        let mut tuples = insert_tuples.lock().unwrap();
-                                                                        tuples.push((
-                                                                            signature.clone(),
-                                                                            slot,
-                                                                            source_acc.to_string(),
-                                                                            dest_acc.to_string(),
-                                                                            amount_i64,
-                                                                            usdc_mint.clone(),
-                                                                        ));
+                                                                if let OptionSerializer::Some(pre_token_balances) = &meta.pre_token_balances {
+                                                                    if let Some(source_pre_token_bal) = pre_token_balances.iter().find(|p| account_keys[p.account_index as usize].to_string() == source_acc.to_string()){
+                                                                        if source_pre_token_bal.mint != usdc_mint {
+                                                                            println!("Debug log - Found the source token mint is not usdc mint");
+                                                                            continue;
+                                                                        }
+                                                                    }else{
+                                                                        println!("Debug log - Unable to find the source pre token balance");
                                                                     }
                                                                 }
+                                                                println!("Debug log - **************** Adding a whale record ************************");
+                                                                let mut tuples = insert_tuples.lock().unwrap();
+                                                                tuples.push((
+                                                                    signature.clone(),
+                                                                    slot,
+                                                                    source_acc.to_string(),
+                                                                    dest_acc.to_string(),
+                                                                    amount_i64,
+                                                                    usdc_mint.clone(),
+                                                                ));
+                                                            }else {
+                                                                println!("Debug log - The amount is not enough to be considered a whale transfer");
                                                             }
                                                         }
                                                         "TransferChecked" => {
