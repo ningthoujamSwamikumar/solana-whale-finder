@@ -1,4 +1,4 @@
-use std::{str::FromStr, sync::{Arc}};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Ok, Result};
 use futures::{StreamExt, future::join_all};
@@ -12,7 +12,7 @@ use solana_client::{
 };
 use spl_token_interface::{instruction::TokenInstruction};
 use sqlx::{PgPool, Postgres};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{sync::{OwnedSemaphorePermit, Semaphore}, time::timeout};
 
 pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -453,35 +453,62 @@ async fn worker(permit: OwnedSemaphorePermit, log_response: RpcLogsResponse, rec
 }
 
 /// Collects records to do batch push into db
+/// pushes at a set time or when reach batch limit reached or at system interrupt
 async fn db_pusher(mut receiver: tokio::sync::mpsc::Receiver<TxnRecord>, pg_pool: PgPool)->Result<()>{
-    let mut tuples = vec![];
+    let batch_size: usize = 100;
+    let mut txn_records: Vec<TxnRecord> = Vec::with_capacity(batch_size);
 
-    while let Some(tuple) = receiver.recv().await {
-        tuples.push(tuple); //collect into a temporary list
+    loop {
+        // Timeout the waiting for records from the upstream tasks
+        let result = timeout(Duration::new(2, 0), receiver.recv()).await;
 
-        // condition for triggering batch insertion
-        if tuples.len() > 19 {
-            // build query to do batch insertion
-            let mut qb: sqlx::QueryBuilder<Postgres> = sqlx::QueryBuilder::new(
-                "INSERT INTO whale_txns
-                ( signature, slot, source_token_acc, dest_token_acc, amount, mint ) ",
-            );
-
-            // let tuples_copy = tuples.clone();
-            //tuples.clear();
-            let tuples = std::mem::take(&mut tuples);
-            qb.push_values(tuples, |mut b, (sig, slot, source, dest, amnt, mint) | {
-                b.push_bind(sig).push_bind(slot).push_bind(source).push_bind(dest).push_bind(amnt).push_bind(mint);
-            });
-
-            let pg_result = qb.build().execute(&pg_pool).await?;
-            println!("*******************************************************************************");
-            println!("********************            inserted {} row            ********************", pg_result.rows_affected());
-            println!("*******************************************************************************");
-        } else {
-            println!("Batch size not reached.");
-        }
+        match result {
+            // When receiver recieves a record before timeout
+            std::result::Result::Ok(Some(record)) => {
+                txn_records.push(record);
+                if txn_records.len() > batch_size {
+                    flush_batch(&mut txn_records, &pg_pool).await?;
+                }
+            },
+            // When the channel is broken, maybe because of system interrupt
+            std::result::Result::Ok(None)=>{
+                // flush the records present in the buffer
+                if !txn_records.is_empty() {
+                    flush_batch(&mut txn_records, &pg_pool).await?;
+                }
+                eprintln!("Debug log - TxnRecord channel is broken!");
+                break;
+            },
+            // Timeout
+            Err(_) => {
+                // flush the waiting records
+                if !txn_records.is_empty() {
+                    flush_batch(&mut txn_records, &pg_pool).await?;
+                }
+                eprintln!("Debug log - Txn record waiting timeout!");
+                break;
+            },
+        };
     }
+
+    Ok(())
+}
+
+async fn flush_batch(txn_records: &mut Vec<TxnRecord>, pg_pool: &PgPool)->Result<()>{
+    let mut qb: sqlx::QueryBuilder<Postgres> = sqlx::QueryBuilder::new(
+        "INSERT INTO whale_txns
+        ( signature, slot, source_token_acc, dest_token_acc, amount, mint ) ",
+    );
+
+    let tuples = std::mem::take(txn_records);
+    qb.push_values(tuples, |mut b, (sig, slot, source, dest, amnt, mint) | {
+        b.push_bind(sig).push_bind(slot).push_bind(source).push_bind(dest).push_bind(amnt).push_bind(mint);
+    });
+
+    let pg_result = qb.build().execute(pg_pool).await?;
+    println!("*******************************************************************************");
+    println!("********************            inserted {} row            ********************", pg_result.rows_affected());
+    println!("*******************************************************************************");
 
     Ok(())
 }
