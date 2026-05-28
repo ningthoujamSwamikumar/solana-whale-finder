@@ -1,20 +1,22 @@
-use std::{str::FromStr, sync::{Arc, Mutex}};
+use std::{str::FromStr, sync::{Arc}};
 
 use anyhow::{Ok, Result};
-use futures::StreamExt;
+use futures::{StreamExt, future::join_all};
 use solana_client::{
     nonblocking::{
         pubsub_client::PubsubClient,
         rpc_client::RpcClient,
     }, rpc_config::{RpcTransactionConfig, RpcTransactionLogsConfig}, rpc_request::Address, rpc_response::{
-        OptionSerializer,
-        transaction::{Signature, VersionedMessage},
+        OptionSerializer, RpcLogsResponse, transaction::{Signature, VersionedMessage}
     }
 };
 use spl_token_interface::{instruction::TokenInstruction};
 use sqlx::{PgPool, Postgres};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+type TxnRecord = (String, i64, String, String, i64, String);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -51,49 +53,101 @@ async fn main() -> Result<()> {
     let rpc_url = std::env::var("RPC_URL").expect("Required Rpc endpoint Url!");
     let arc_rpc_client = Arc::new(RpcClient::new(rpc_url));
 
-    let usdc_mint = USDC_MINT.to_string();
+    // async communication channel
+    let (log_tx, log_rx) = tokio::sync::mpsc::channel::<RpcLogsResponse>(100); 
 
     //create websocket connection
     let ws_rpc_url = std::env::var("WEBSOCKET_RPC_URL").expect("Required 'WEBSOCKET_RPC_URL'!");
     let ws_client = PubsubClient::new(ws_rpc_url).await?;
     let (mut log_stream, _log_unsubscribe) = ws_client
         .logs_subscribe(
-            solana_client::rpc_config::RpcTransactionLogsFilter::Mentions(vec![usdc_mint.clone()]),
+            solana_client::rpc_config::RpcTransactionLogsFilter::Mentions(vec![USDC_MINT.to_string()]),
             RpcTransactionLogsConfig { commitment: None },
         )
         .await?;
     println!("Debug log - Websocket connected");
 
+    // spawn the filter cum dispatcher, and keep it ready to receive messages
+    let dispatcher_handle = tokio::spawn(filter_logs_and_dispatch(log_rx, arc_rpc_client, pg_pool));
+
+    println!("Debug log - Streaming logs from websocket");
     while let Some(log_response) = log_stream.next().await {
         println!("Debug log - Received Response");
 
-        if log_response.value.err.is_some() {
+        // deligate the msg to process to filter cum dispatcher
+        log_tx.send(log_response.value).await?;
+    };
+
+    println!("Debug log - Waiting on dispatcher to complete");
+    dispatcher_handle.await??;
+
+    Ok(())
+}
+
+/// Filter logs for successful transactions and pass down to workers
+async fn filter_logs_and_dispatch(mut receiver: tokio::sync::mpsc::Receiver<RpcLogsResponse>, rpc_client: Arc<solana_client::nonblocking::rpc_client::RpcClient>, pg_pool: PgPool)->Result<()>{
+    println!("Debug log - Welcome to Dispatcher");
+    
+    // worker permits
+    let workers_semaphor = Arc::new(Semaphore::new(10));
+
+    // record collection channel for batch insertion
+    let (record_tx, record_rx) = tokio::sync::mpsc::channel::<TxnRecord>(50);
+    // batch insertion worker
+    println!("Debug log - spawning Db Pusher for batch insertions");
+    let db_pusher_handle = tokio::spawn(db_pusher(record_rx, pg_pool));
+
+    let mut worker_handles = vec![];
+
+    while let Some(log_response) = receiver.recv().await {
+        if log_response.err.is_some() {
             println!("Debug log - Transaction has error");
             // failed transactions
             continue;
         }
+        
         // successful transactions
 
+        // get permission or wait for permission and spawn a worker task
+        println!("Debug log - Waiting for a worker permission");
+        let permit = workers_semaphor.clone().acquire_owned().await?;
+        let rpc_client_clone = rpc_client.clone();
+        let txn_record_sender = record_tx.clone();
+
+        println!("Debug log - spawning a new worker");
+        let worker_handle = tokio::spawn(worker(permit, log_response, txn_record_sender, rpc_client_clone));
+        worker_handles.push(worker_handle);
+    };
+
+    println!("Debug log - Waiting on workers to complete current in hand processings...");
+    join_all(worker_handles).await;
+
+    println!("Debug log - Waiting on db_pusher to finish");
+    db_pusher_handle.await??;
+
+    Ok(())
+}
+
+/// Worker task/function to process the logs, find whale txns 
+async fn worker(permit: OwnedSemaphorePermit, log_response: RpcLogsResponse, record_sender: tokio::sync::mpsc::Sender<TxnRecord>, rpc_client: Arc<solana_client::nonblocking::rpc_client::RpcClient>)->Result<()>{
         // filter for usdc transfers
         // since legacy token doesn't log the name of instruction being invoked,
         // we'll just qualify every transaction thats coming from the websocket
         // because transaction already mentions USDC mint and
         // there is a high chance it is a transfer, we'll do the final check later
         if !log_response
-            .value
             .logs
             .iter()
             .any(|lg| lg.contains(spl_token_interface::ID.to_string().as_str()))
         {
             println!("Debug log - Transaction logs doesn't contain token program");
-            continue;
+            return Ok(());
         }
 
         // process transactions for qualified transactions
 
         // fetch transaction from rpc node
-        let txn_signature = Signature::from_str(log_response.value.signature.as_str())?;
-        let rpc_client = arc_rpc_client.clone();
+        let txn_signature = Signature::from_str(log_response.signature.as_str())?;
         let encoded_confirmed_txn = rpc_client
             .get_transaction_with_config(
                 &txn_signature,
@@ -105,6 +159,8 @@ async fn main() -> Result<()> {
             )
             .await?;
         println!("Debug log - Fetched transaction from rpc");
+
+        let usdc_mint = USDC_MINT.to_string();
 
         // decode and process each transaction
         if let Some(txn) = encoded_confirmed_txn.transaction.transaction.decode() {
@@ -123,16 +179,9 @@ async fn main() -> Result<()> {
                 },
             };
 
-            // build query to do batch insertion
-            let mut qb: sqlx::QueryBuilder<Postgres> = sqlx::QueryBuilder::new(
-                "INSERT INTO whale_txns
-                ( signature, slot, source_token_acc, dest_token_acc, amount, mint ) ",
-            );
-
-            let signature = log_response.value.signature;
+            let signature = log_response.signature;
             let slot = encoded_confirmed_txn.slot as i64;
 
-            let insert_tuples = Arc::new(Mutex::new(vec![]));
             // process outer instructions
             println!("Debug log - Processing instructions...");
             let insn_futures = insns
@@ -144,8 +193,8 @@ async fn main() -> Result<()> {
                     let account_keys = account_keys.clone();
                     let usdc_mint = usdc_mint.clone();
                     let txn_meta = encoded_confirmed_txn.transaction.meta.clone();
-                    let insert_tuples = insert_tuples.clone();
                     let signature = signature.clone();
+                    let record_sender = record_sender.clone();
 
                     println!("Debug log - Passed the program id filter, and checking futher...");
 
@@ -176,16 +225,15 @@ async fn main() -> Result<()> {
                                             if source_pre_token_bal.mint == usdc_mint {
                                                 println!("Debug log - Waiting for insert_tuples lock");
                                                 // verified that the transfer is usdc transfer
-                                                let mut tuples = insert_tuples.lock().unwrap();
-                                                println!("Debug log - ******************* Adding a tuple into insert_tuples *******************");
-                                                tuples.push((
+                                                println!("Debug log - ******************* Found a whale record *******************");
+                                                record_sender.send((
                                                     signature.clone(),
                                                     slot,
                                                     source_acc.to_string(),
                                                     dest_acc.to_string(),
                                                     amount as i64,
                                                     usdc_mint.clone(),
-                                                ));
+                                                )).await.unwrap();
                                             }
                                         }
                                     }else {
@@ -207,16 +255,15 @@ async fn main() -> Result<()> {
                                 let dest_acc = account_keys[insn.accounts[2] as usize];
                                 // check if the mint is usdc
                                 if mint.to_string() == usdc_mint {
-                                    println!("Debug log - *************** Adding a whale record **************");
-                                    let mut tuples = insert_tuples.lock().unwrap();
-                                    tuples.push((
+                                    println!("Debug log - *************** Found a whale record **************");
+                                    record_sender.send((
                                         signature.clone(),
                                         slot,
                                         source_acc.to_string(),
                                         dest_acc.to_string(),
                                         amount as i64,
                                         usdc_mint.clone(),
-                                    ));
+                                    )).await.unwrap();
                                 };
                             },
                             _ => {
@@ -269,15 +316,14 @@ async fn main() -> Result<()> {
                                                         };
                                                         // usdc mint transfer
                                                         println!("Debug log - ************* Adding a whale record ************ ");
-                                                        let mut tuples = insert_tuples.lock().unwrap();
-                                                        tuples.push((
+                                                        record_sender.send((
                                                             signature.clone(),
                                                             slot,
                                                             source_acc.to_string(),
                                                             dest_acc.to_string(),
                                                             amount as i64,
                                                             usdc_mint.clone(),
-                                                        ));
+                                                        )).await?;
                                                     }
                                                     TokenInstruction::TransferChecked { amount, decimals: _ }=>{
                                                         println!("Debug log - Found TransferChecked as inner instruction");
@@ -294,15 +340,14 @@ async fn main() -> Result<()> {
                                                         println!("Debug log - Validating mint against usdc mint.");
                                                         if mint.to_string() == usdc_mint {
                                                             println!("Debug log - *************** Adding a whale record *******************");
-                                                            let mut tuples = insert_tuples.lock().unwrap();
-                                                            tuples.push((
+                                                            record_sender.send((
                                                                 signature.clone(),
                                                                 slot,
                                                                 source_acc.to_string(),
                                                                 dest_acc.to_string(),
                                                                 amount as i64,
                                                                 usdc_mint.clone(),
-                                                            ));
+                                                            )).await?;
                                                         };
                                                     },
                                                     _=>{
@@ -346,15 +391,14 @@ async fn main() -> Result<()> {
                                                                     }
                                                                 }
                                                                 println!("Debug log - **************** Adding a whale record ************************");
-                                                                let mut tuples = insert_tuples.lock().unwrap();
-                                                                tuples.push((
+                                                                record_sender.send((
                                                                     signature.clone(),
                                                                     slot,
                                                                     source_acc.to_string(),
                                                                     dest_acc.to_string(),
                                                                     amount_i64,
                                                                     usdc_mint.clone(),
-                                                                ));
+                                                                )).await?;
                                                             }else {
                                                                 println!("Debug log - The amount is not enough to be considered a whale transfer");
                                                             }
@@ -371,15 +415,14 @@ async fn main() -> Result<()> {
                                                             println!("Debug log - Validation mint and amount for whale usdc transfer");
                                                             if !mint.is_empty() && amount_i64 > 10_000_000_000 && mint.to_string() == usdc_mint {
                                                                 println!("Debug log - ***************** Adding a whale transfer *********************");
-                                                                let mut tuples = insert_tuples.lock().unwrap();
-                                                                tuples.push((
+                                                                record_sender.send((
                                                                     signature.clone(),
                                                                     slot,
                                                                     source_acc.to_string(),
                                                                     dest_acc.to_string(),
                                                                     amount_i64,
                                                                     usdc_mint.clone(),
-                                                                ));
+                                                                )).await?;
                                                             }
                                                         }
                                                         _ => {
@@ -401,21 +444,43 @@ async fn main() -> Result<()> {
                     }
                 }
             };
-
-            // we will do this after inner instructions are handled
-            let tuples =  insert_tuples.lock().unwrap();
-            if tuples.len() > 0 {
-                qb.push_values(tuples.iter(), |mut b, (sig, slot, source, dest, amnt, mint) | {
-                    b.push_bind(sig).push_bind(slot).push_bind(source).push_bind(dest).push_bind(amnt).push_bind(mint);
-                });
-
-                let pg_result = qb.build().execute(&pg_pool).await?;
-                println!("inserted {} rows", pg_result.rows_affected());
-            } else {
-                println!("There are no tuples found to insert into db!");
-            }
-
+            
         };
+
+        drop(permit);
+
+        Ok(())
+}
+
+/// Collects records to do batch push into db
+async fn db_pusher(mut receiver: tokio::sync::mpsc::Receiver<TxnRecord>, pg_pool: PgPool)->Result<()>{
+    let mut tuples = vec![];
+
+    while let Some(tuple) = receiver.recv().await {
+        tuples.push(tuple); //collect into a temporary list
+
+        // condition for triggering batch insertion
+        if tuples.len() > 19 {
+            // build query to do batch insertion
+            let mut qb: sqlx::QueryBuilder<Postgres> = sqlx::QueryBuilder::new(
+                "INSERT INTO whale_txns
+                ( signature, slot, source_token_acc, dest_token_acc, amount, mint ) ",
+            );
+
+            // let tuples_copy = tuples.clone();
+            //tuples.clear();
+            let tuples = std::mem::take(&mut tuples);
+            qb.push_values(tuples, |mut b, (sig, slot, source, dest, amnt, mint) | {
+                b.push_bind(sig).push_bind(slot).push_bind(source).push_bind(dest).push_bind(amnt).push_bind(mint);
+            });
+
+            let pg_result = qb.build().execute(&pg_pool).await?;
+            println!("*******************************************************************************");
+            println!("********************            inserted {} row            ********************", pg_result.rows_affected());
+            println!("*******************************************************************************");
+        } else {
+            println!("Batch size not reached.");
+        }
     }
 
     Ok(())
