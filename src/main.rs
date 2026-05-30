@@ -469,72 +469,10 @@ async fn worker(
                                     };
                                 };
                             }
-                            solana_client::rpc_response::UiInstruction::Parsed(
-                                ui_parsed_instruction,
-                            ) => {
+                            solana_client::rpc_response::UiInstruction::Parsed(_) => {
                                 println!(
                                     "Debug log - Unexpected !! Found Parse Instruction in Inner instruction."
                                 );
-                                match ui_parsed_instruction {
-                                        solana_client::rpc_response::UiParsedInstruction::Parsed(parsed_instruction) => {
-                                            println!("Debug log - Checking program id in Parsed instruction...");
-                                            if &parsed_instruction.program_id == SPL_TOKEN {
-                                                if let (Some(instruction_type), Some(info)) = (parsed_instruction.parsed.get("type").and_then(|t|t.as_str()), parsed_instruction.parsed.get("info")){
-                                                    match instruction_type {
-                                                        "transfer" => {
-                                                            println!("Debug log - Found transfer instruction in parsed-inner instruction");
-                                                            // Standard transfer instruction
-                                                            let source_acc = info.get("source").and_then(|s| s.as_str()).unwrap_or("");
-                                                            let dest_acc = info.get("destination").and_then(|d|d.as_str()).unwrap_or("");
-                                                            let amount = info.get("amount").and_then(|a|a.as_str()).unwrap_or("");
-                                                            let amount_i64 = i64::from_str(amount)?;
-
-                                                            // validate the mint of source account if non empty, and check if its a whale transfer
-                                                            if !source_acc.is_empty() && !dest_acc.is_empty() && amount_i64 > 10_000_000_000 {
-                                                                let source_acc_address = Address::from_str(source_acc)?;
-                                                                println!("Debug log - Validating mint");
-                                                                if let OptionSerializer::Some(pre_token_balances) = &meta.pre_token_balances {
-                                                                    if let Some(source_pre_token_bal) = pre_token_balances.iter().find(|p| account_keys[p.account_index as usize] == source_acc_address){
-                                                                        if &source_pre_token_bal.mint != USDC_MINT {
-                                                                            println!("Debug log - Found the source token mint is not usdc mint");
-                                                                            continue;
-                                                                        }
-                                                                    }else{
-                                                                        println!("Debug log - Unable to find the source pre token balance");
-                                                                    }
-                                                                }
-                                                                println!("Debug log - **************** Adding a whale record ************************");
-                                                                record_sender.send(TxnRecord { signature, slot, source_token_acc: source_acc_address, dest_token_acc: Address::from_str(dest_acc)?, amount: amount_i64, mint: USDC_MINT_ADDRESS }).await?;
-                                                            }else {
-                                                                println!("Debug log - The amount is not enough to be considered a whale transfer");
-                                                            }
-                                                        }
-                                                        "TransferChecked" => {
-                                                            println!("Debug log - Found TransferChecked instruction in parsed-inner instruction");
-                                                            let source_acc = info.get("source").and_then(|s| s.as_str()).unwrap_or("");
-                                                            let dest_acc = info.get("destination").and_then(|d|d.as_str()).unwrap_or("");
-                                                            let amount = info.get("amount").and_then(|a|a.as_str()).unwrap_or("");
-                                                            let mint = info.get("mint").and_then(|m| m.as_str()).unwrap_or("");
-                                                            let amount_i64 = i64::from_str(amount).unwrap_or(0);
-
-                                                            // validate the mint of source account if non empty, and check if its a whale
-                                                            println!("Debug log - Validation mint and amount for whale usdc transfer");
-                                                            if !source_acc.is_empty() && !dest_acc.is_empty() && !mint.is_empty() && amount_i64 > 10_000_000_000 && mint == USDC_MINT {
-                                                                println!("Debug log - ***************** Adding a whale transfer *********************");
-                                                                record_sender.send(TxnRecord { signature, slot, source_token_acc: Address::from_str(source_acc)?, dest_token_acc: Address::from_str(dest_acc)?, amount: amount_i64, mint: USDC_MINT_ADDRESS}).await?;
-                                                                }
-                                                        }
-                                                        _ => {
-                                                            println!("{} - Not a transfer instruction in inner instruction!", instruction_type);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        },
-                                        solana_client::rpc_response::UiParsedInstruction::PartiallyDecoded(_) => {
-                                            println!("Debug log - Unexpected instruction: UiParsedInstruction::PartiallyDecoded !");
-                                        },
-                                    }
                             }
                         }
                     }
