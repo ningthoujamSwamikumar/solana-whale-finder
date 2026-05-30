@@ -17,6 +17,7 @@ use tokio::time::timeout;
 
 pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 pub const USDC_MINT_ADDRESS: Address = Address::from_str_const(USDC_MINT);
+pub const SPL_TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 struct TxnRecord {
     signature: Signature,
@@ -145,11 +146,7 @@ async fn worker(
     // we'll just qualify every transaction thats coming from the websocket
     // because transaction already mentions USDC mint and
     // there is a high chance it is a transfer, we'll do the final check later
-    if !log_response
-        .logs
-        .iter()
-        .any(|lg| lg.contains(spl_token_interface::ID.to_string().as_str()))
-    {
+    if !log_response.logs.iter().any(|lg| lg.contains(SPL_TOKEN)) {
         println!("Debug log - Transaction logs doesn't contain token program");
         return Ok(());
     }
@@ -229,7 +226,6 @@ async fn worker(
 
         let txn_meta = encoded_confirmed_txn.transaction.meta;
         let signature = txn.signatures[0];
-        let usdc_mint = USDC_MINT.to_string();
 
         // process outer instructions
         println!("Debug log - Processing instructions...");
@@ -238,11 +234,9 @@ async fn worker(
                 continue;
             };
 
-            let record_sender = record_sender.clone();
-
             println!("Debug log - Passed the program id filter, and checking futher...");
 
-            let token_insn = TokenInstruction::unpack(&insn.data).unwrap();
+            let token_insn = TokenInstruction::unpack(&insn.data)?;
             println!("Debug log - Unpacked token instruction.");
             match token_insn {
                 TokenInstruction::Transfer { amount } => {
@@ -281,8 +275,7 @@ async fn worker(
                                             amount: amount as i64,
                                             mint: USDC_MINT_ADDRESS,
                                         })
-                                        .await
-                                        .unwrap();
+                                        .await?;
                                 }
                             }
                         } else {
@@ -317,8 +310,7 @@ async fn worker(
                                 amount: amount as i64,
                                 mint: USDC_MINT_ADDRESS,
                             })
-                            .await
-                            .unwrap();
+                            .await?;
                     };
                 }
                 _ => {
@@ -481,12 +473,12 @@ async fn worker(
                                 ui_parsed_instruction,
                             ) => {
                                 println!(
-                                    "Debug log - Found Parse Instruction in Inner instruction"
+                                    "Debug log - Unexpected !! Found Parse Instruction in Inner instruction."
                                 );
                                 match ui_parsed_instruction {
                                         solana_client::rpc_response::UiParsedInstruction::Parsed(parsed_instruction) => {
                                             println!("Debug log - Checking program id in Parsed instruction...");
-                                            if parsed_instruction.program_id == spl_token_interface::ID.to_string() {
+                                            if &parsed_instruction.program_id == SPL_TOKEN {
                                                 if let (Some(instruction_type), Some(info)) = (parsed_instruction.parsed.get("type").and_then(|t|t.as_str()), parsed_instruction.parsed.get("info")){
                                                     match instruction_type {
                                                         "transfer" => {
@@ -529,8 +521,8 @@ async fn worker(
                                                             println!("Debug log - Validation mint and amount for whale usdc transfer");
                                                             if !source_acc.is_empty() && !dest_acc.is_empty() && !mint.is_empty() && amount_i64 > 10_000_000_000 && mint == USDC_MINT {
                                                                 println!("Debug log - ***************** Adding a whale transfer *********************");
-                                                                record_sender.send(TxnRecord { signature, slot, source_token_acc: Address::from_str(source_acc)?, dest_token_acc: Address::from_str(dest_acc)?, amount: amount_i64, mint: USDC_MINT_ADDRESS }).await?;
-                                                            }
+                                                                record_sender.send(TxnRecord { signature, slot, source_token_acc: Address::from_str(source_acc)?, dest_token_acc: Address::from_str(dest_acc)?, amount: amount_i64, mint: USDC_MINT_ADDRESS}).await?;
+                                                                }
                                                         }
                                                         _ => {
                                                             println!("{} - Not a transfer instruction in inner instruction!", instruction_type);
@@ -539,10 +531,8 @@ async fn worker(
                                                 }
                                             }
                                         },
-                                        solana_client::rpc_response::UiParsedInstruction::PartiallyDecoded(ui_partially_decoded_instruction) => {
-                                            if ui_partially_decoded_instruction.program_id == spl_token_interface::ID.to_string() {
-                                                println!("Unexpected Instruction format found!");
-                                            }
+                                        solana_client::rpc_response::UiParsedInstruction::PartiallyDecoded(_) => {
+                                            println!("Debug log - Unexpected instruction: UiParsedInstruction::PartiallyDecoded !");
                                         },
                                     }
                             }
@@ -606,9 +596,9 @@ async fn flush_batch(txn_records: &mut Vec<TxnRecord>, pg_pool: &PgPool) -> Resu
         ( signature, slot, source_token_acc, dest_token_acc, amount, mint ) ",
     );
 
-    let tuples = std::mem::take(txn_records);
+    let record_buffer = std::mem::take(txn_records);
     qb.push_values(
-        tuples,
+        record_buffer,
         |mut b,
          TxnRecord {
              signature,
