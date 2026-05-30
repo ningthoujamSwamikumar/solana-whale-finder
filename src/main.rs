@@ -67,23 +67,28 @@ async fn main() -> Result<()> {
     let (record_tx, record_rx) = tokio::sync::mpsc::channel::<TxnRecord>(50);
     // batch insertion worker
     println!("Debug log - spawning Db Pusher for batch insertions");
-    tokio::spawn(db_pusher(record_rx, pg_pool));
+    let db_pusher_handle = tokio::spawn(db_pusher(record_rx, pg_pool));
 
     // spawn static task pool
     let (workers_log_tx, workers_log_rx) = async_channel::bounded::<RpcLogsResponse>(1000);
     let worker_pool_size = 20;
     println!("Debug log - initializing worker pool");
-    for id in 0..worker_pool_size {
+    let mut worker_handles = Vec::with_capacity(worker_pool_size);
+    for _ in 0..worker_pool_size {
         let workers_log_rx = workers_log_rx.clone();
         let rpc_client = arc_rpc_client.clone();
         let record_tx = record_tx.clone();
-        tokio::spawn(filter_logs_and_dispatch(
+        let handle = tokio::spawn(filter_logs_and_dispatch(
             workers_log_rx,
             record_tx,
             rpc_client,
         ));
-        println!("Debug log - task {} spawned", id);
+        println!("Debug log - worker id: {} spawned", handle.id());
+        worker_handles.push(handle);
     }
+
+    //drop the local channel to prevent from staying open forever
+    drop(workers_log_rx);
 
     //create websocket connection
     let ws_rpc_url = std::env::var("WEBSOCKET_RPC_URL").expect("Required 'WEBSOCKET_RPC_URL'!");
@@ -99,12 +104,41 @@ async fn main() -> Result<()> {
     println!("Debug log - Websocket connected");
 
     println!("Debug log - Streaming logs from websocket");
-    while let Some(log_response) = log_stream.next().await {
-        println!("Debug log - Received Response");
+    tokio::select! {
+        _ = async {
+            // Log/Data Ingestion loop
+            while let Some(log_response) = log_stream.next().await {
+                println!("Debug log - Received Response");
 
-        // deligate the msg to process to filter cum dispatcher
-        workers_log_tx.send(log_response.value).await?;
+                // deligate the msg to process to filter cum dispatcher
+                if let Err(e) = workers_log_tx.send(log_response.value).await {
+                    eprintln!("Failed to send log to workers. Error: {:?}", e);
+                    println!("Shutting down indexer due to error in log passing channel. Draining pipeline...");
+                    break;
+                }
+            }
+        } => {},
+        _ = tokio::signal::ctrl_c() => {
+            println!("Shutdown signal intercepted. Draining pipeline...");
+        }
     }
+
+    // Explicit drop to notify workers that no new logs are coming.
+    drop(workers_log_tx);
+    // draining pipeline
+    for handle in worker_handles {
+        if let Err(e) = handle.await {
+            println!("Worker stopped. {:?}", e);
+        }
+    }
+    // drop the record transmitter after all current processing are done
+    drop(record_tx);
+    // Wait for the db pusher taskt to complete
+    if let Err(e) = db_pusher_handle.await {
+        println!("Db pusher has stop. {:?}", e);
+    }
+
+    println!("Pipeline gracefully shutdown.");
 
     Ok(())
 }
@@ -129,7 +163,10 @@ async fn filter_logs_and_dispatch(
         let rpc_client = rpc_client.clone();
         let record_sender = record_tx.clone();
 
-        worker(log_response, record_sender, rpc_client).await?;
+        if let Err(e) = worker(log_response, record_sender, rpc_client).await {
+            eprintln!("Failed to process a log. Error: {:?}", e);
+            continue;
+        }
     }
 
     Ok(())
@@ -211,13 +248,13 @@ async fn worker(
                         account_keys.reserve(
                             loaded_addresses.writable.len() + loaded_addresses.readonly.len(),
                         ); // prevents from frequent reallocation
-                        account_keys.extend(
-                            loaded_addresses
-                                .writable
-                                .iter()
-                                .chain(loaded_addresses.readonly.iter())
-                                .map(|s| Address::from_str(s.as_str()).unwrap()),
-                        );
+                        for addr in loaded_addresses
+                            .writable
+                            .iter()
+                            .chain(loaded_addresses.readonly.iter())
+                        {
+                            account_keys.push(Address::from_str(addr.as_str())?);
+                        }
                     }
                 }
                 (account_keys, msg.instructions)
@@ -341,11 +378,10 @@ async fn worker(
                                         "Debug log - Found token program in inner instruction"
                                     );
                                     //decode the instruction data
-                                    let raw_data =
-                                        bs58::decode(&ui_compiled_instruction.data).into_vec()?;
-                                    let sanitized_raw_data =
-                                        sanitize_token_data(&raw_data.as_slice());
-                                    match TokenInstruction::unpack(&sanitized_raw_data) {
+                                    let mut raw_sanitized_data = [0; 10];
+                                    bs58::decode(&ui_compiled_instruction.data)
+                                        .onto(&mut raw_sanitized_data)?;
+                                    match TokenInstruction::unpack(&raw_sanitized_data) {
                                         std::result::Result::Ok(token_insn) => {
                                             println!(
                                                 "Debug log - unpacked inner instruction into TokenInstruction"
@@ -469,7 +505,7 @@ async fn worker(
                                     };
                                 };
                             }
-                            solana_client::rpc_response::UiInstruction::Parsed(_) => {
+                            _ => {
                                 println!(
                                     "Debug log - Unexpected !! Found Parse Instruction in Inner instruction."
                                 );
@@ -574,7 +610,7 @@ fn token_instruction_name(token_insn: &TokenInstruction) -> String {
     format!("{:?}", token_insn)
         .split_whitespace()
         .next()
-        .unwrap()
+        .unwrap_or("")
         .trim_end_matches('{')
         .to_string()
 }
