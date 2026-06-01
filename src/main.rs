@@ -223,19 +223,19 @@ async fn worker(
             continue;
         }
 
+        // filter for usdc transfers
+        // since legacy token doesn't log the name of instruction being invoked,
+        // we'll just qualify every transaction thats coming from the websocket
+        // because transaction already mentions USDC mint and
+        // there is a high chance it is a transfer, we'll do the final check later
+        if !log_response.logs.iter().any(|lg| lg.contains(SPL_TOKEN)) {
+            println!("Debug log - Transaction logs doesn't contain token program");
+            continue;
+        }
+
+        // process transactions for qualified transactions
         let res: Result<()> = {
-            // filter for usdc transfers
-            // since legacy token doesn't log the name of instruction being invoked,
-            // we'll just qualify every transaction thats coming from the websocket
-            // because transaction already mentions USDC mint and
-            // there is a high chance it is a transfer, we'll do the final check later
-            if !log_response.logs.iter().any(|lg| lg.contains(SPL_TOKEN)) {
-                println!("Debug log - Transaction logs doesn't contain token program");
-                return Ok(());
-            }
-
-            // process transactions for qualified transactions
-
+            let mut result: Result<()> = Ok(());
             // fetch transaction from rpc node
             let txn_signature = Signature::from_str(log_response.signature.as_str())?;
             // RPC guardrail with manual retries and exponential backoff
@@ -269,7 +269,7 @@ async fn worker(
                             attempts, max_attempts, txn_signature, e
                         );
                         if attempts >= max_attempts {
-                            return Err(anyhow::anyhow!(
+                            result = Err(anyhow::anyhow!(
                                 "RPC execution max retries exhausted for txn: {}",
                                 txn_signature
                             ));
@@ -573,7 +573,7 @@ async fn worker(
                 };
             }
 
-            Ok(())
+            result
         };
 
         // handle each processing result gracefully
