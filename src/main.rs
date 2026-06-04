@@ -1,8 +1,4 @@
-use std::{
-    str::FromStr,
-    sync::{Arc, mpsc},
-    time::Duration,
-};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Ok, Result};
 use futures::StreamExt;
@@ -47,16 +43,24 @@ async fn main() -> Result<()> {
     .await?;
 
     // lets use only the token accounts for now, we can add the owners later if necessary
+    // below fields are added after the initial table structure
+    // signature_bytes, source_token_bytes, dest_token_bytes, mint_bytes
+    // NOT NULL has been dropped from column signature, source_token_acc, dest_token_acc, mint
+    // later - drop the original TEXT versions of the respective columns
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS whale_txns (
             id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             signature TEXT, 
+            signature_bytes BYTEA,
             slot BIGINT NOT NULL,
             source_token_acc TEXT NOT NULL,
+            source_token_bytes BYTEA,
             dest_token_acc TEXT NOT NULL,
+            dest_token_bytes BYTEA,
             amount BIGINT NOT NULL, 
             mint TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            mint_bytes BYTEA,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         );",
     )
     .execute(&pg_pool)
@@ -139,11 +143,13 @@ async fn run_worker_orchestrator(
     arc_rpc_client: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
     record_tx: tokio::sync::mpsc::Sender<TxnRecord>,
 ) -> Result<()> {
-    let worker_pool_size = 20;
+    let worker_pool_size = std::env::var("WORKER_POOL_SIZE").map_or(10, |s| {
+        i32::from_str(&s).expect("Failed to convert POOL SIZE env var!")
+    });
     let (workers_log_tx, workers_log_rx) = async_channel::bounded::<RpcLogsResponse>(1000);
 
     println!("Debug log - initializing worker pool");
-    let mut worker_handles = Vec::with_capacity(worker_pool_size);
+    let mut worker_handles = Vec::with_capacity(worker_pool_size as usize);
     for _ in 0..worker_pool_size {
         let workers_log_rx = workers_log_rx.clone();
         let rpc_client = arc_rpc_client.clone();
@@ -170,19 +176,28 @@ async fn run_worker_orchestrator(
 
     println!("Debug log - waiting for workers to complete the in hand works");
     for worker in worker_handles {
-        worker.await??;
+        match worker.await {
+            std::result::Result::Ok(join_result) => {
+                if let Err(e) = join_result {
+                    eprintln!("Task return error. Error: {:?}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to join worker task! Error: {:?}", e);
+            }
+        }
     }
     println!("Debug log - all workers are terminated");
 
     // A component writing to a data lier must outlive the components generating the work
-    // So, we are dropping this after all the workers are confirmed terminated, 
+    // So, we are dropping this after all the workers are confirmed terminated,
     // so to not close the channel totally before the whale data are written
     drop(record_tx);
 
     Ok(())
 }
 
-// Don't use kind of function, because it calls an async function, and 
+// Don't use kind of function, because it calls an async function, and
 // when the data receiving loop exits because the trasmitter has been closed,
 // the async part might not be ready, and it hangs in the air.
 
@@ -637,7 +652,7 @@ async fn db_pusher(
 async fn flush_batch(txn_records: &mut Vec<TxnRecord>, pg_pool: &PgPool) -> Result<()> {
     let mut qb: sqlx::QueryBuilder<Postgres> = sqlx::QueryBuilder::new(
         "INSERT INTO whale_txns
-        ( signature, slot, source_token_acc, dest_token_acc, amount, mint ) ",
+        ( signature_bytes, slot, source_token_bytes, dest_token_bytes, amount, mint_bytes ) ",
     );
 
     let record_buffer = std::mem::take(txn_records);
@@ -652,16 +667,22 @@ async fn flush_batch(txn_records: &mut Vec<TxnRecord>, pg_pool: &PgPool) -> Resu
              amount,
              mint,
          }| {
-            b.push_bind(signature.to_string())
+            b
+                //  .push_bind(signature.to_string())
+                .push_bind(<[u8; 64]>::from(signature))
                 .push_bind(slot)
-                .push_bind(source_token_acc.to_string())
-                .push_bind(dest_token_acc.to_string())
+                //    .push_bind(source_token_acc.to_string())
+                .push_bind(source_token_acc.to_bytes())
+                //    .push_bind(dest_token_acc.to_string())
+                .push_bind(dest_token_acc.to_bytes())
                 .push_bind(amount)
-                .push_bind(mint.to_string());
+                //    .push_bind(mint.to_string())
+                .push_bind(mint.to_bytes());
         },
     );
 
-    let pg_result = qb.build().execute(pg_pool).await?;
+    let qry = qb.build();
+    let pg_result = qry.execute(pg_pool).await?;
     println!("*******************************************************************************");
     println!(
         "********************            inserted {} row            ********************",
