@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
             amount BIGINT NOT NULL, 
             mint TEXT NOT NULL,
             mint_bytes BYTEA,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );",
     )
     .execute(&pg_pool)
@@ -109,10 +109,9 @@ async fn main() -> Result<()> {
 
                 // deligate the msg to process to filter cum dispatcher
                 if let Err(e) = orchestrator_log_tx.send(log_response.value).await {
-                    eprintln!("Failed to send log to workers. Error: {:?}", e);
-                    // This allows the loop to skip the current packet block and continue even when an error due
-                    // to channel full, from slow worker processing happens
-                    continue;
+                    eprintln!("Failed to send log to worker. \nError: {:?}", e);
+                    // send returns error only when the receiver is dropped
+                    break;
                 }
             }
         } => {},
@@ -196,34 +195,6 @@ async fn run_worker_orchestrator(
 
     Ok(())
 }
-
-// Don't use kind of function, because it calls an async function, and
-// when the data receiving loop exits because the trasmitter has been closed,
-// the async part might not be ready, and it hangs in the air.
-
-/// Filter logs for successful transactions and pass down to workers
-// async fn filter_logs_and_dispatch(
-//     worker_log_receiver: async_channel::Receiver<RpcLogsResponse>,
-//     record_tx: tokio::sync::mpsc::Sender<TxnRecord>,
-//     rpc_client: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
-// ) -> Result<()> {
-//     println!("Debug log - Welcome to Dispatcher");
-//     while let std::result::Result::Ok(log_response) = worker_log_receiver.recv().await {
-//         if log_response.err.is_some() {
-//             println!("Debug log - Transaction has error");
-//             // failed transactions
-//             continue;
-//         }
-//         // successful transactions
-//         let rpc_client = rpc_client.clone();
-//         let record_sender = record_tx.clone();
-//         if let Err(e) = worker(log_response, record_sender, rpc_client).await {
-//             eprintln!("Failed to process a log. Error: {:?}", e);
-//             continue;
-//         }
-//     }
-//     Ok(())
-// }
 
 /// Worker task/function to process the logs, find whale txns
 async fn worker(
@@ -449,105 +420,72 @@ async fn worker(
                                                 "Debug log - Found token program in inner instruction"
                                             );
                                             //decode the instruction data
-                                            let mut raw_sanitized_data = [0; 10];
-                                            bs58::decode(&ui_compiled_instruction.data)
-                                                .onto(&mut raw_sanitized_data)?;
-                                            match TokenInstruction::unpack(&raw_sanitized_data) {
-                                                std::result::Result::Ok(token_insn) => {
-                                                    println!(
-                                                        "Debug log - unpacked inner instruction into TokenInstruction"
-                                                    );
-                                                    match token_insn {
-                                                        TokenInstruction::Transfer { amount } => {
-                                                            println!(
-                                                                "Debug log - Found transfer as inner instruction."
-                                                            );
-                                                            if amount < 10_000_000_000 {
+                                            let mut raw_sanitized_data = [0u8; 128];
+                                            if let std::result::Result::Ok(decoded_bytes) =
+                                                bs58::decode(&ui_compiled_instruction.data)
+                                                    .onto(&mut raw_sanitized_data)
+                                            {
+                                                match TokenInstruction::unpack(
+                                                    &raw_sanitized_data[..decoded_bytes],
+                                                ) {
+                                                    std::result::Result::Ok(token_insn) => {
+                                                        println!(
+                                                            "Debug log - unpacked inner instruction into TokenInstruction"
+                                                        );
+                                                        match token_insn {
+                                                            TokenInstruction::Transfer {
+                                                                amount,
+                                                            } => {
                                                                 println!(
-                                                                    "Debug log - The amount is less than the whale threshold"
+                                                                    "Debug log - Found transfer as inner instruction."
                                                                 );
-                                                                continue;
-                                                            }
-                                                            // the transfer now consist of whale amount
-                                                            let source_acc = account_keys
-                                                                [ui_compiled_instruction.accounts[0]
-                                                                    as usize];
-                                                            let dest_acc = account_keys
-                                                                [ui_compiled_instruction.accounts[1]
-                                                                    as usize];
-                                                            if let OptionSerializer::Some(
-                                                                pre_token_balances,
-                                                            ) = &meta.pre_token_balances
-                                                            {
-                                                                if let Some(source_pre_token_bal) =
-                                                                    pre_token_balances.iter().find(
-                                                                        |p| {
+                                                                if amount < 10_000_000_000 {
+                                                                    println!(
+                                                                        "Debug log - The amount is less than the whale threshold"
+                                                                    );
+                                                                    continue;
+                                                                }
+                                                                // the transfer now consist of whale amount
+                                                                let source_acc = account_keys
+                                                                    [ui_compiled_instruction
+                                                                        .accounts[0]
+                                                                        as usize];
+                                                                let dest_acc = account_keys
+                                                                    [ui_compiled_instruction
+                                                                        .accounts[1]
+                                                                        as usize];
+                                                                if let OptionSerializer::Some(
+                                                                    pre_token_balances,
+                                                                ) = &meta.pre_token_balances
+                                                                {
+                                                                    if let Some(
+                                                                        source_pre_token_bal,
+                                                                    ) = pre_token_balances
+                                                                        .iter()
+                                                                        .find(|p| {
                                                                             p.account_index
                                                                     == ui_compiled_instruction
                                                                         .accounts[0]
-                                                                        },
-                                                                    )
-                                                                {
-                                                                    if &source_pre_token_bal.mint
-                                                                        != USDC_MINT
+                                                                        })
                                                                     {
+                                                                        if &source_pre_token_bal
+                                                                            .mint
+                                                                            != USDC_MINT
+                                                                        {
+                                                                            println!(
+                                                                                "Debug log - Source acc doesn't have usdc mint"
+                                                                            );
+                                                                            continue;
+                                                                        }
+                                                                    } else {
                                                                         println!(
-                                                                            "Debug log - Source acc doesn't have usdc mint"
+                                                                            "Debug log - Failed to find the source account in pre token balances"
                                                                         );
-                                                                        continue;
                                                                     }
-                                                                } else {
-                                                                    println!(
-                                                                        "Debug log - Failed to find the source account in pre token balances"
-                                                                    );
-                                                                }
-                                                            };
-                                                            // usdc mint transfer
-                                                            println!(
-                                                                "Debug log - ************* Adding a whale record ************ "
-                                                            );
-                                                            record_sender
-                                                                .send(TxnRecord {
-                                                                    signature,
-                                                                    slot,
-                                                                    source_token_acc: source_acc,
-                                                                    dest_token_acc: dest_acc,
-                                                                    amount: amount as i64,
-                                                                    mint: USDC_MINT_ADDRESS,
-                                                                })
-                                                                .await?;
-                                                        }
-                                                        TokenInstruction::TransferChecked {
-                                                            amount,
-                                                            decimals: _,
-                                                        } => {
-                                                            println!(
-                                                                "Debug log - Found TransferChecked as inner instruction"
-                                                            );
-                                                            // whale amount validation
-                                                            if amount < 10_000_000_000 {
+                                                                };
+                                                                // usdc mint transfer
                                                                 println!(
-                                                                    "Debug log - The amount isn't enough to be whale"
-                                                                );
-                                                                continue;
-                                                            }
-                                                            // the transfer now consists of whale amount
-                                                            let source_acc = account_keys
-                                                                [ui_compiled_instruction.accounts[0]
-                                                                    as usize];
-                                                            let mint = account_keys
-                                                                [ui_compiled_instruction.accounts[1]
-                                                                    as usize];
-                                                            let dest_acc = account_keys
-                                                                [ui_compiled_instruction.accounts[2]
-                                                                    as usize];
-                                                            // check if the mint is usdc
-                                                            println!(
-                                                                "Debug log - Validating mint against usdc mint."
-                                                            );
-                                                            if mint == USDC_MINT_ADDRESS {
-                                                                println!(
-                                                                    "Debug log - *************** Adding a whale record *******************"
+                                                                    "Debug log - ************* Adding a whale record ************ "
                                                                 );
                                                                 record_sender
                                                                     .send(TxnRecord {
@@ -560,20 +498,71 @@ async fn worker(
                                                                         mint: USDC_MINT_ADDRESS,
                                                                     })
                                                                     .await?;
-                                                            };
-                                                        }
-                                                        _ => {
-                                                            println!("Not a transfer instruction.");
-                                                        }
-                                                    };
-                                                }
-                                                Err(e) => {
-                                                    println!(
-                                                        "Failed to unpack raw data into TokenInstruction:\n{}",
-                                                        e.to_string()
-                                                    );
-                                                }
-                                            };
+                                                            }
+                                                            TokenInstruction::TransferChecked {
+                                                                amount,
+                                                                decimals: _,
+                                                            } => {
+                                                                println!(
+                                                                    "Debug log - Found TransferChecked as inner instruction"
+                                                                );
+                                                                // whale amount validation
+                                                                if amount < 10_000_000_000 {
+                                                                    println!(
+                                                                        "Debug log - The amount isn't enough to be whale"
+                                                                    );
+                                                                    continue;
+                                                                }
+                                                                // the transfer now consists of whale amount
+                                                                let source_acc = account_keys
+                                                                    [ui_compiled_instruction
+                                                                        .accounts[0]
+                                                                        as usize];
+                                                                let mint = account_keys
+                                                                    [ui_compiled_instruction
+                                                                        .accounts[1]
+                                                                        as usize];
+                                                                let dest_acc = account_keys
+                                                                    [ui_compiled_instruction
+                                                                        .accounts[2]
+                                                                        as usize];
+                                                                // check if the mint is usdc
+                                                                println!(
+                                                                    "Debug log - Validating mint against usdc mint."
+                                                                );
+                                                                if mint == USDC_MINT_ADDRESS {
+                                                                    println!(
+                                                                        "Debug log - *************** Adding a whale record *******************"
+                                                                    );
+                                                                    record_sender
+                                                                        .send(TxnRecord {
+                                                                            signature,
+                                                                            slot,
+                                                                            source_token_acc:
+                                                                                source_acc,
+                                                                            dest_token_acc:
+                                                                                dest_acc,
+                                                                            amount: amount as i64,
+                                                                            mint: USDC_MINT_ADDRESS,
+                                                                        })
+                                                                        .await?;
+                                                                };
+                                                            }
+                                                            _ => {
+                                                                println!(
+                                                                    "Not a transfer instruction."
+                                                                );
+                                                            }
+                                                        };
+                                                    }
+                                                    Err(e) => {
+                                                        println!(
+                                                            "Failed to unpack raw data into TokenInstruction:\n{}",
+                                                            e.to_string()
+                                                        );
+                                                    }
+                                                };
+                                            }
                                         };
                                     }
                                     _ => {
@@ -622,7 +611,8 @@ async fn db_pusher(
             // When receiver recieves a record before timeout
             std::result::Result::Ok(Some(record)) => {
                 txn_records.push(record);
-                if txn_records.len() > batch_size {
+                // hit batch size limit
+                if txn_records.len() >= batch_size {
                     flush_batch(&mut txn_records, &pg_pool).await?;
                 }
             }
