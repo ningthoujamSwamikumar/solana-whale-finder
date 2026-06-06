@@ -103,7 +103,6 @@ pub(crate) async fn worker(
                     if let Some(txn_meta) = &encoded_confirmed_txn.transaction.meta {
                         if let OptionSerializer::Some(loaded_addresses) = &txn_meta.loaded_addresses
                         {
-                            println!("Debug log - Extending account keys with loaded addresses");
                             account_keys.reserve(
                                 loaded_addresses.writable.len() + loaded_addresses.readonly.len(),
                             ); // prevents from frequent reallocation

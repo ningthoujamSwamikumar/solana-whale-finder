@@ -81,16 +81,11 @@ async fn flush_batch(txn_records: &mut Vec<TxnRecord>, pg_pool: &PgPool) -> Resu
              amount,
              mint,
          }| {
-            b
-                //  .push_bind(signature.to_string())
-                .push_bind(<[u8; 64]>::from(signature))
+            b.push_bind(<[u8; 64]>::from(signature))
                 .push_bind(slot)
-                //    .push_bind(source_token_acc.to_string())
                 .push_bind(source_token_acc.to_bytes())
-                //    .push_bind(dest_token_acc.to_string())
                 .push_bind(dest_token_acc.to_bytes())
                 .push_bind(amount)
-                //    .push_bind(mint.to_string())
                 .push_bind(mint.to_bytes());
         },
     );

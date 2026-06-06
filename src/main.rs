@@ -105,13 +105,11 @@ async fn main() -> Result<()> {
     // record collection channel for batch insertion
     let (record_tx, record_rx) = tokio::sync::mpsc::channel::<TxnRecord>(50);
     // batch insertion worker
-    println!("Debug log - spawning Db Pusher for batch insertions");
     let db_pusher_handle = tokio::spawn(db_pusher(record_rx, pg_pool));
 
     // spawn static task pool
     let (orchestrator_log_tx, orchestrator_log_rx) =
         tokio::sync::mpsc::channel::<RpcLogsResponse>(100);
-    println!("Debug log - spawning Worker Orchestrator.");
     let orchestrator_handle = tokio::spawn(run_worker_orchestrator(
         orchestrator_log_rx,
         arc_rpc_client,
