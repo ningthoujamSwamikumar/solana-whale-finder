@@ -9,10 +9,16 @@ async-channel = "2.5.0"
 bs58 = "0.5.1"
 dotenv = "0.15.0"
 futures = "0.3.32"
+metrics = "0.24.6"
+metrics-exporter-prometheus = "0.18.3"
+rustls = { version = "0.23.40", features = ["ring"] }
 serde = "1.0.228"
 serde_json = "1.0.149"
 solana-client = "3.1.14"
 spl-token-2022-interface = "3.0.0"
 spl-token-interface = "3.0.0"
 sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio"] }
+tikv-jemallocator = "0.7.0"     # replaces glibc allocator, which is default rust allocator in linux
 tokio = { version = "1.52.3", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
