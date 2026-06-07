@@ -13,7 +13,7 @@ use solana_client::{
 use spl_token_interface::instruction::TokenInstruction;
 use tracing::{error, info, instrument, warn};
 
-use crate::{SPL_TOKEN, TxnRecord, USDC_MINT, USDC_MINT_ADDRESS};
+use crate::{RedactExt, SPL_TOKEN, TxnRecord, USDC_MINT, USDC_MINT_ADDRESS};
 
 // Automatically creates heirarchical logging spans tied exclusively to the unique worker instances
 #[instrument(skip_all, fields(worker_id = _id))]
@@ -23,6 +23,7 @@ pub(crate) async fn worker(
     log_receiver: async_channel::Receiver<RpcLogsResponse>,
     record_sender: tokio::sync::mpsc::Sender<TxnRecord>,
     rpc_client: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    rpc_url: Arc<String>,
 ) -> Result<()> {
     while let std::result::Result::Ok(log_response) = log_receiver.recv().await {
         if log_response.err.is_some() {
@@ -70,11 +71,12 @@ pub(crate) async fn worker(
                 }
                 Err(e) => {
                     attempts += 1;
+                    let sanitized_e = e.redact_key(&*rpc_url);
                     counter!("pipeline.rpc_errors_total").increment(1);
                     warn!(
                         signature = %txn_signature,
                         attempt = attempts,
-                        error=?e,
+                        error=sanitized_e,
                         "Solana RPC transaction retrieval transient network failure warning."
                     );
                     tokio::time::sleep(delay).await;

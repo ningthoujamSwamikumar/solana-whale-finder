@@ -1,11 +1,9 @@
-use std::sync::Arc;
-
 use anyhow::{Context, Ok, Result};
 use futures::StreamExt;
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use solana_client::{
-    nonblocking::{pubsub_client::PubsubClient, rpc_client::RpcClient},
+    nonblocking::pubsub_client::PubsubClient,
     rpc_config::RpcTransactionLogsConfig,
     rpc_request::Address,
     rpc_response::{RpcLogsResponse, transaction::Signature},
@@ -98,10 +96,6 @@ async fn main() -> Result<()> {
     .await?;
     info!("Database core transaction tables verified.");
 
-    // create rpc client
-    let rpc_url = std::env::var("RPC_URL").expect("Required Rpc endpoint Url!");
-    let arc_rpc_client = Arc::new(RpcClient::new(rpc_url));
-
     // record collection channel for batch insertion
     let (record_tx, record_rx) = tokio::sync::mpsc::channel::<TxnRecord>(50);
     // batch insertion worker
@@ -110,11 +104,7 @@ async fn main() -> Result<()> {
     // spawn static task pool
     let (orchestrator_log_tx, orchestrator_log_rx) =
         tokio::sync::mpsc::channel::<RpcLogsResponse>(100);
-    let orchestrator_handle = tokio::spawn(run_worker_orchestrator(
-        orchestrator_log_rx,
-        arc_rpc_client,
-        record_tx,
-    ));
+    let orchestrator_handle = tokio::spawn(run_worker_orchestrator(orchestrator_log_rx, record_tx));
 
     //create websocket connection
     let ws_rpc_url = std::env::var("WEBSOCKET_RPC_URL").expect("Required 'WEBSOCKET_RPC_URL'!");
@@ -167,4 +157,32 @@ async fn main() -> Result<()> {
 
     info!("Pipeline safely shutdown. Memory pools cleanly recycled.");
     Ok(())
+}
+
+pub(crate) trait RedactExt<T> {
+    /// Sanitizes error string variants to strip away sensitive Solana Solana RPC private key paths.
+    fn redact_key(self, sensitive_url: &str) -> String;
+}
+
+impl<E: std::fmt::Debug> RedactExt<E> for E {
+    fn redact_key(self, sensitive_url: &str) -> String {
+        let error_string = format!("{:?}", self);
+
+        // Extract the raw API Key token from your environment URL configuration
+        // e.g. If URL is "https://mainnet.helius-rpc.com/?api-key=abc123xyz"
+        // we isolate "abc123xyz" or simply search for the entire URL base sequence.
+        if let Some(key_index) = sensitive_url.find("api-key=") {
+            let token = &sensitive_url[key_index..];
+            if !token.is_empty() {
+                return error_string.replace(token, "api-key=[REDACTED]");
+            }
+        }
+
+        // Alternative fallback: Blindly mask the entire custom RPC URL if it's found inside the debug error dump
+        if error_string.contains(sensitive_url) {
+            return error_string.replace(sensitive_url, "https://[RPC_URL_REDACTED]");
+        }
+
+        error_string
+    }
 }
