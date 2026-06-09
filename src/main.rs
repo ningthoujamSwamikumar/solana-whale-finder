@@ -6,7 +6,10 @@ use solana_client::{
     nonblocking::pubsub_client::PubsubClient,
     rpc_config::RpcTransactionLogsConfig,
     rpc_request::Address,
-    rpc_response::{RpcLogsResponse, transaction::Signature},
+    rpc_response::{
+        OptionSerializer, RpcLogsResponse,
+        transaction::{Signature, VersionedMessage},
+    },
 };
 use sqlx::PgPool;
 
@@ -29,6 +32,25 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub(crate) const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 pub(crate) const USDC_MINT_ADDRESS: Address = Address::from_str_const(USDC_MINT);
 pub(crate) const SPL_TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+
+/// Domain Model: Decoupled entirely from the transport mechanism (JSON-RPC or Proto)
+pub(crate) struct UnifiedTxnPayload {
+    pub signature: Signature,
+    pub slot: u64,
+    pub message: VersionedMessage,
+    pub pre_token_balances:
+        OptionSerializer<Vec<solana_client::rpc_response::UiTransactionTokenBalance>>,
+    pub inner_instructions: OptionSerializer<Vec<solana_client::rpc_response::UiInnerInstructions>>,
+    pub loaded_addresses: OptionSerializer<solana_client::rpc_response::UiLoadedAddresses>,
+}
+
+/// Abstract source strategy supporting both RPC polling and GRPC/Geyser pushes
+pub(crate) enum InboundTxnSource {
+    /// Raw logs that demand an external http pull lookup roundtrip
+    RpcLogGate(RpcLogsResponse),
+    /// Zero-roundtrip push payloads (Geyser/Yellowstone GRPC)
+    DirechPushStream(UnifiedTxnPayload),
+}
 
 pub(crate) struct TxnRecord {
     signature: Signature,
@@ -103,7 +125,7 @@ async fn main() -> Result<()> {
 
     // spawn static task pool
     let (orchestrator_log_tx, orchestrator_log_rx) =
-        tokio::sync::mpsc::channel::<RpcLogsResponse>(100);
+        tokio::sync::mpsc::channel::<InboundTxnSource>(100);
     let orchestrator_handle = tokio::spawn(run_worker_orchestrator(orchestrator_log_rx, record_tx));
 
     //create websocket connection
@@ -131,13 +153,20 @@ async fn main() -> Result<()> {
 
 
                 // deligate the msg to process to filter cum dispatcher
-                if let Err(_) = orchestrator_log_tx.send(log_response.value).await {
+                if let Err(_) = orchestrator_log_tx.send(InboundTxnSource::RpcLogGate(log_response.value)).await {
                     error!("Orchestrator channel disconnected. Closing network streaming pipeline.");
                     // send returns error only when the receiver is dropped
                     break;
                 }
             }
         } => {},
+        // --- PREMIUM gRPC / GEYSER PLUGIN INGESTION (READY TO PLUG IN) ---
+        // _ = async {
+        //     while let Some(grpc_message) = my_geyser_grpc_stream.next().await {
+        //          let unified_payload = parse_grpc_to_unified(grpc_message);
+        //          let _ = orchestrator_tx.send(InboundTxnSource::DirectPushStream(unified_payload)).await;
+        //     }
+        // } => {},
         _ = tokio::signal::ctrl_c() => {
             warn!("System shutdown signal captured. Terminating pipeline execution chains gracefully...");
         }

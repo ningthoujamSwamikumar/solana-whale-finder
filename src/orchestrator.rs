@@ -2,19 +2,19 @@ use std::{str::FromStr, sync::Arc};
 
 use anyhow::{Ok, Result};
 use metrics::gauge;
-use solana_client::{nonblocking::rpc_client::RpcClient, rpc_response::RpcLogsResponse};
+use solana_client::nonblocking::rpc_client::RpcClient;
 use tracing::error;
 
-use crate::{TxnRecord, worker::worker};
+use crate::{InboundTxnSource, TxnRecord, worker::worker};
 
 pub(crate) async fn run_worker_orchestrator(
-    mut orchestrator_log_reciever: tokio::sync::mpsc::Receiver<RpcLogsResponse>,
+    mut orchestrator_log_reciever: tokio::sync::mpsc::Receiver<InboundTxnSource>,
     record_tx: tokio::sync::mpsc::Sender<TxnRecord>,
 ) -> Result<()> {
     let worker_pool_size = std::env::var("WORKER_POOL_SIZE").map_or(10, |s| {
         i32::from_str(&s).expect("Failed to convert POOL SIZE env var!")
     });
-    let (workers_log_tx, workers_log_rx) = async_channel::bounded::<RpcLogsResponse>(1000);
+    let (workers_log_tx, workers_log_rx) = async_channel::bounded::<InboundTxnSource>(1000);
 
     // create rpc client
     let arc_rpc_url = Arc::new(std::env::var("RPC_URL").expect("Required Rpc endpoint Url!"));
