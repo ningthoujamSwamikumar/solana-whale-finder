@@ -22,3 +22,5 @@ tikv-jemallocator = "0.7.0"     # replaces glibc allocator, which is default rus
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+yellowstone-grpc-client = "13.1.0"
+yellowstone-grpc-proto = "12.4.0"
