@@ -1,6 +1,6 @@
 use futures::{SinkExt, StreamExt};
 use std::{collections::HashMap, error::Error};
-use yellowstone_grpc_proto::geyser::{SubscribeRequest, SubscribeRequestFilterTransactions};
+use yellowstone_grpc_proto::geyser::{SubscribeRequest, SubscribeRequestFilterTransactions, subscribe_update::UpdateOneof};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -34,7 +34,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Read updates for the subscription made above
     while let Some(msg) = geyser_stream.next().await {
         match msg {
-            Ok(update) => println!("{:#?}", update),
+            Ok(update) => {
+                if let Some( one_of)= update.update_oneof {
+                    if let UpdateOneof::Transaction(txn_update) = one_of {
+                        println!("Transaction Update: \n{:#?}", txn_update)
+                    }
+                }
+            },
             Err(e) => {
                 eprintln!("Stream Error: {e}");
                 break;
