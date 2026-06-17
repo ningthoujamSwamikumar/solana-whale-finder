@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 async-channel = "2.5.0"
+bincode = { version = "2", features = ["serde"] }
 bs58 = "0.5.1"
 dotenv = "0.15.0"
 futures = "0.3.32"
@@ -15,12 +16,14 @@ rustls = { version = "0.23.40", features = ["ring"] }
 serde = "1.0.228"
 serde_json = "1.0.149"
 solana-client = "3.1.14"
+solana-sdk = "4.0.1"
 solana-system-interface = { version = "3.2.0", features = ["bincode"] }
 spl-token-2022-interface = "3.0.0"
 spl-token-interface = "3.0.0"
 sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio"] }
 tikv-jemallocator = "0.7.0"     # replaces glibc allocator, which is default rust allocator in linux
 tokio = { version = "1.52.3", features = ["full"] }
+tokio-util = "0.7.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 yellowstone-grpc-client = "13.1.0"
@@ -28,6 +31,4 @@ yellowstone-grpc-proto = "12.4.0"
 
 [dev-dependencies]
 rand = "0.10.1"
-solana-sdk = "3.0.0"
 spl-associated-token-account-interface = "2.0.0"
-tokio-util = "0.7.18"

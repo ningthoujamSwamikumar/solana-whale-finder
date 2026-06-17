@@ -14,12 +14,18 @@ use solana_client::{
 use sqlx::PgPool;
 
 use rustls::crypto::ring::default_provider;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::{orchestrator::run_worker_orchestrator, storage::db_pusher};
+use crate::{
+    grpc_source_gate::run_grpc_subscription, orchestrator::run_worker_orchestrator,
+    rpc_log_gate::run_rpc_websocket_subscription, storage::db_pusher,
+};
 
+mod grpc_source_gate;
 mod orchestrator;
+mod rpc_log_gate;
 mod storage;
 mod worker;
 
@@ -124,57 +130,37 @@ async fn main() -> Result<()> {
     let db_pusher_handle = tokio::spawn(db_pusher(record_rx, pg_pool));
 
     // spawn static task pool
-    let (orchestrator_log_tx, orchestrator_log_rx) =
+    let (orchestrator_msg_tx, orchestrator_msg_rx) =
         tokio::sync::mpsc::channel::<InboundTxnSource>(100);
-    let orchestrator_handle = tokio::spawn(run_worker_orchestrator(orchestrator_log_rx, record_tx));
+    let orchestrator_handle = tokio::spawn(run_worker_orchestrator(orchestrator_msg_rx, record_tx));
 
-    //create websocket connection
-    let ws_rpc_url = std::env::var("WEBSOCKET_RPC_URL").expect("Required 'WEBSOCKET_RPC_URL'!");
-    let ws_client = PubsubClient::new(ws_rpc_url).await?;
-    let (mut log_stream, _log_unsubscribe) = ws_client
-        .logs_subscribe(
-            solana_client::rpc_config::RpcTransactionLogsFilter::Mentions(vec![
-                USDC_MINT.to_string(),
-            ]),
-            RpcTransactionLogsConfig { commitment: None },
-        )
-        .await?;
-    info!("Solana Cluster Websocket pipeline established. Streamin live blocks...");
-
-    tokio::select! {
-        _ = async {
-            // Log/Data Ingestion loop
-            while let Some(log_response) = log_stream.next().await {
-                // Increment total logs ingested metrics counter
-                counter!("pipeline.logs_ingested_total").increment(1);
-
-                // Dynamically trace length of the orchestrator inbound channel to observe structural backpressure
-                gauge!("pipeline.orchestrator_channel_depth").set((orchestrator_log_tx.max_capacity() - orchestrator_log_tx.capacity()) as f64);
-
-
-                // deligate the msg to process to filter cum dispatcher
-                if let Err(_) = orchestrator_log_tx.send(InboundTxnSource::RpcLogGate(log_response.value)).await {
-                    error!("Orchestrator channel disconnected. Closing network streaming pipeline.");
-                    // send returns error only when the receiver is dropped
-                    break;
-                }
-            }
-        } => {},
-        // --- PREMIUM gRPC / GEYSER PLUGIN INGESTION (READY TO PLUG IN) ---
-        // _ = async {
-        //     while let Some(grpc_message) = my_geyser_grpc_stream.next().await {
-        //          let unified_payload = parse_grpc_to_unified(grpc_message);
-        //          let _ = orchestrator_tx.send(InboundTxnSource::DirectPushStream(unified_payload)).await;
-        //     }
-        // } => {},
-        _ = tokio::signal::ctrl_c() => {
-            warn!("System shutdown signal captured. Terminating pipeline execution chains gracefully...");
+    let mut grpc_opted = false;
+    for arg in std::env::args() {
+        if &arg == "--use-grpc" {
+            grpc_opted = true;
+            break;
         }
     }
 
-    // Explicit drop to notify workers that no new logs are coming.
-    // This will only allow the rx to recv all the already buffered messages
-    drop(orchestrator_log_tx);
+    let cancel_token = CancellationToken::new();
+    tokio::select! {
+        _ = async {
+            // start the data source based on the user input through env var
+            if grpc_opted {
+                // call grpc client
+                tokio::spawn(run_grpc_subscription(orchestrator_msg_tx, cancel_token.clone()));
+            }else {
+                // default
+                // run websocket rpc client
+                tokio::spawn(run_rpc_websocket_subscription(orchestrator_msg_tx, cancel_token.clone()));
+            }
+        } => {},
+        _ = tokio::signal::ctrl_c() => {
+            warn!("System shutdown signal captured. Terminating pipeline execution chains gracefully...");
+            cancel_token.cancel();
+        }
+    }
+
     if let Err(e) = orchestrator_handle.await? {
         error!("Orchestrator Error: {:?}", e);
     }
