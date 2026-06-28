@@ -144,6 +144,22 @@ pub(crate) async fn worker(
                 }
                 (account_keys, msg.instructions)
             }
+            VersionedMessage::V1(message) => {
+                let mut account_keys = message.account_keys;
+                if let OptionSerializer::Some(loaded_addresses) = &txn_payload.loaded_addresses {
+                    account_keys
+                        .reserve(loaded_addresses.writable.len() + loaded_addresses.readonly.len()); // prevents from frequent reallocation
+                    for addr in loaded_addresses
+                        .writable
+                        .iter()
+                        .chain(loaded_addresses.readonly.iter())
+                    {
+                        account_keys.push(Address::from_str(addr.as_str())?);
+                    }
+                }
+
+                (account_keys, message.instructions)
+            }
         };
 
         let signature = txn_payload.signature;
