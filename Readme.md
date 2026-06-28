@@ -3,28 +3,19 @@ A concurrent, low-latency blockchain indexing engine built with Rust. Designed t
 
 ## Architecture and Concurrency Model
 - **Decoupled Orchestration**: Separated network ingestion from Database IO. Uses a supervisor loop that feeds a fixed pool of 20 persistent async worker tasks via a `tokio::sync::mpsc` channels.
-- **Protocol Agnostic Ingestion**: Allows the engine to consume faster geyser grpc stream, as well as RPC websocket stream by abstracting away the network ingestion from the other components.
+- **Protocol Agnostic Ingestion**: Allows the engine to consume faster geyser grpc stream, as well as RPC websocket stream by abstracting away the network ingestion from the processings.
 - **Database Batching & Non-blocking I/O**: Offloaded PostgreSQL operations to a dedicated background actor thread. Implemented a custom batch accumulation routine (`flush_batch`) utilizing `sqlx::QueryBuilder` to aggregate hundreds of incoming transaction records in-memory, dynamically compiling them into unified multi-row insert statement to protect the database connection pool from exhaustion.
 
 ## Resilience and Backpressure Management
+- **Systematic Backpressure**: Utilized bounded channels which creates a natural consumption throttling at the network interface layer; if the database lags during a traffic spike, the orchestrator safely blocks instead of causing Out-of-Memory explosion.
+- **Zero Data-Loss Graceful Teardown**: Integrated Tokio's `TaskTracker` to manage thread scoping boundaries. During system interrupts (SIGINT), the engine executes an ordered teardown sequence - closing network channels, waiting for all independent worker futures to natively exhaust their queus, and flushing the final database batch before process termination.
 
-
-## Memory Profiling and Low-Allocation Mastery
+## Low-Allocation Mastery
+- **Zero-Copy Deserialization**: Minimized heap allocations on the critical hot-path by decoding base58 byte streams directly into stack-allocated arrays (`bs58::decode().onto(...)`).
 
 ## Production Observability and Security
 
 ## Local Stress Testing and Benchmarks
 
-## Features cum Todo
-- Real time data stream through websocket
-    - Connect to helius websocket endpoint using a Pubsub client from solana-client
-    - subscribe to logs using logSubscribe and filter for transactions that mention USDC mint
-    > - Filtering by the USDC mint might miss us out on transactions that uses transfer instruction because transfer instruction doesn't require token mint. But modern transactions usually uses transfer checked instruction as historically using transfer instruction led to transfer to wrong address and lost lots of money.
-    > - This is a tradeoff between getting 100% transactions and hitting rate limit or exhaustion of our limited compute resources, and getting 99% transaction.
-    - fetch filter passed transaction from rpc node.
-        - kdkkd
-        - kdkdk
-- Filter and extract whales
-- fetch whale transaction and store them
 
 
